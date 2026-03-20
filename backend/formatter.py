@@ -62,6 +62,11 @@ class Formatter:
         # 2. Rebuild using Composer to inherit template master properties
         template_doc = Document(self.template_path)
         
+        import copy
+        template_sectPr = template_doc.element.body.xpath('./w:sectPr')
+        header_refs = template_sectPr[0].xpath('./w:headerReference') if template_sectPr else []
+        footer_refs = template_sectPr[0].xpath('./w:footerReference') if template_sectPr else []
+        
         # Clear body of template doc to leave only styles, headers, footers
         body = template_doc.element.body
         for element in list(body.iterchildren()):
@@ -73,11 +78,18 @@ class Formatter:
         styled_doc = Document(styled_input_path)
         composer.append(styled_doc)
         
-        # MANDATORY: Retain the exact template header and footer across all appended sections
-        if len(composer.doc.sections) > 1:
-            for section in composer.doc.sections[1:]:
-                section.header.is_linked_to_previous = True
-                section.footer.is_linked_to_previous = True
+        # MANDATORY: Forcefully balance all section headers/footers to match the template exactly
+        for sectPr in composer.doc.element.xpath('//w:sectPr'):
+            for existing in sectPr.xpath('./w:headerReference'):
+                sectPr.remove(existing)
+            for existing in sectPr.xpath('./w:footerReference'):
+                sectPr.remove(existing)
+            
+            # Inject isolated template header/footer references
+            for href in header_refs:
+                sectPr.append(copy.deepcopy(href))
+            for fref in footer_refs:
+                sectPr.append(copy.deepcopy(fref))
         
         composer.save(self.output_path)
         logger.info(f"Successfully generated formatted document {self.output_path}")
