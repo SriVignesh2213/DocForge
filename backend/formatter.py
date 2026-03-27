@@ -89,6 +89,10 @@ class Formatter:
         normalized = self._normalized_heading_text(text)
         return (
             normalized.startswith("keywords:")
+            or normalized.startswith("figure labels:")
+            or normalized.startswith("figure label:")
+            or normalized.startswith("table labels:")
+            or normalized.startswith("table label:")
             or self.TABLE_CAPTION_RE.match(text)
             or self.FIGURE_CAPTION_RE.match(text)
             or normalized.startswith("chart ")
@@ -97,12 +101,29 @@ class Formatter:
             or normalized.startswith("scheme.")
         )
 
+    def _get_list_level(self, paragraph):
+        paragraph_properties = paragraph._p.pPr
+        if paragraph_properties is None:
+            return None
+
+        numbering_properties = paragraph_properties.find(qn('w:numPr'))
+        if numbering_properties is None:
+            return None
+
+        level = numbering_properties.find(qn('w:ilvl'))
+        if level is None:
+            return 0
+
+        return self._coerce_int(level.get(qn('w:val')), 0)
+
     def _is_heading_candidate(self, paragraph, text, is_bold, max_size):
         style_name = paragraph.style.name.lower()
+        list_level = self._get_list_level(paragraph)
         return (
             ('heading' in style_name)
             or (is_bold and 10 < max_size <= 14 and len(text.split()) < 20)
             or (self._extract_numbering(text) and len(text.split()) < 20)
+            or (list_level is not None and list_level >= 1 and len(text.split()) < 20)
         )
 
     def _is_section_heading(self, paragraph, text, is_bold, max_size):
@@ -152,6 +173,10 @@ class Formatter:
         if numbering:
             numbering = numbering.rstrip('.)')
             return 2 if '.' in numbering else 1
+
+        list_level = self._get_list_level(paragraph)
+        if list_level is not None:
+            return 1 if list_level == 0 else 2
 
         normalized = self._normalized_heading_text(text)
         if any(term in normalized for term in self.MAJOR_SECTION_TERMS):
