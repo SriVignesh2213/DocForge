@@ -116,24 +116,133 @@ class Formatter:
 
         return self._coerce_int(level.get(qn('w:val')), 0)
 
-    def _is_heading_candidate(self, paragraph, text, is_bold, max_size):
+    def _get_list_num_id(self, paragraph):
+        paragraph_properties = paragraph._p.pPr
+        if paragraph_properties is None:
+            return None
+
+        numbering_properties = paragraph_properties.find(qn('w:numPr'))
+        if numbering_properties is None:
+            return None
+
+        num_id = numbering_properties.find(qn('w:numId'))
+        if num_id is None:
+            return None
+
+        return self._coerce_int(num_id.get(qn('w:val')), 0)
+
+    def _looks_like_sentence_item(self, text):
+        stripped = self._strip_numbering(text).strip()
+        if not stripped:
+            return False
+
+        words = stripped.rstrip(':').split()
+        return stripped.endswith(('.', ';', '?', '!')) or len(words) > 8
+
+    def _looks_like_heading_label(self, text):
+        stripped = self._strip_numbering(text).strip()
+        if not stripped:
+            return False
+
+        words = stripped.rstrip(':').split()
+        if not words or len(words) > 10 or self._looks_like_sentence_item(stripped):
+            return False
+
+        return True
+
+    def _get_next_non_empty_paragraph(self, paragraphs, index):
+        if paragraphs is None:
+            return None, None
+
+        for next_index in range(index + 1, len(paragraphs)):
+            next_paragraph = paragraphs[next_index]
+            if next_paragraph.text.strip():
+                return next_index, next_paragraph
+
+        return None, None
+
+    def _get_previous_non_empty_paragraph(self, paragraphs, index):
+        if paragraphs is None:
+            return None, None
+
+        for previous_index in range(index - 1, -1, -1):
+            previous_paragraph = paragraphs[previous_index]
+            if previous_paragraph.text.strip():
+                return previous_index, previous_paragraph
+
+        return None, None
+
+    def _is_contextual_list_heading(self, paragraph, paragraphs, index):
+        list_level = self._get_list_level(paragraph)
+        if list_level is None or not self._looks_like_heading_label(paragraph.text):
+            return False
+
+        current_num_id = self._get_list_num_id(paragraph)
+        _, previous_paragraph = self._get_previous_non_empty_paragraph(paragraphs, index)
+        _, next_paragraph = self._get_next_non_empty_paragraph(paragraphs, index)
+        if next_paragraph is None:
+            return False
+
+        previous_level = self._get_list_level(previous_paragraph) if previous_paragraph is not None else None
+        previous_num_id = self._get_list_num_id(previous_paragraph) if previous_paragraph is not None else None
+        next_text = next_paragraph.text.strip()
+        next_level = self._get_list_level(next_paragraph)
+        next_num_id = self._get_list_num_id(next_paragraph)
+
+        if previous_num_id == current_num_id and previous_level == list_level:
+            if not (next_num_id == current_num_id and next_level is not None and next_level > list_level):
+                return False
+
+        if next_level is None:
+            return not self._is_non_section_heading(next_text)
+
+        if current_num_id is not None and next_num_id == current_num_id and next_level > list_level:
+            return True
+
+        if current_num_id is not None and next_num_id != current_num_id:
+            return self._looks_like_heading_label(next_text) or self._looks_like_sentence_item(next_text)
+
+        return False
+
+    def _is_media_lead_in(self, text, paragraphs, index):
+        stripped = self._strip_numbering(text).strip()
+        if not stripped.endswith(':'):
+            return False
+
+        _, next_paragraph = self._get_next_non_empty_paragraph(paragraphs, index)
+        if next_paragraph is None:
+            return False
+
+        next_text = next_paragraph.text.strip()
+        return bool(self.FIGURE_CAPTION_RE.match(next_text) or self.TABLE_CAPTION_RE.match(next_text))
+
+    def _is_heading_candidate(self, paragraph, text, is_bold, max_size, paragraphs=None, index=None):
         style_name = paragraph.style.name.lower()
         list_level = self._get_list_level(paragraph)
+        if paragraphs is not None and index is not None and self._is_media_lead_in(text, paragraphs, index):
+            return False
         return (
             ('heading' in style_name)
             or (is_bold and 10 < max_size <= 14 and len(text.split()) < 20)
             or (self._extract_numbering(text) and len(text.split()) < 20)
-            or (list_level is not None and list_level >= 1 and len(text.split()) < 20)
+            or (
+                list_level is not None
+                and paragraphs is not None
+                and index is not None
+                and self._is_contextual_list_heading(paragraph, paragraphs, index)
+            )
         )
 
-    def _is_section_heading(self, paragraph, text, is_bold, max_size):
+    def _is_section_heading(self, paragraph, text, is_bold, max_size, paragraphs=None, index=None):
         if self._is_non_section_heading(text):
+            return False
+        if paragraphs is not None and index is not None and self._is_media_lead_in(text, paragraphs, index):
             return False
 
         normalized = self._normalized_heading_text(text)
         if normalized in self.MAJOR_SECTION_TERMS:
             return True
-        if self._is_heading_candidate(paragraph, text, is_bold, max_size):
+        if self._is_heading_candidate(paragraph, text, is_bold, max_size, paragraphs, index):
             return True
 
         letters = [char for char in self._strip_numbering(text) if char.isalpha()]
@@ -163,7 +272,7 @@ class Formatter:
 
         return is_bold and 10 < max_size <= 14 and len(text.split()) < 12
 
-    def _get_heading_level(self, paragraph, text):
+    def _get_heading_level(self, paragraph, text, paragraphs=None, index=None):
         style_name = paragraph.style.name.lower()
         digits = ''.join(filter(str.isdigit, style_name))
         if digits:
@@ -174,13 +283,14 @@ class Formatter:
             numbering = numbering.rstrip('.)')
             return 2 if '.' in numbering else 1
 
-        list_level = self._get_list_level(paragraph)
-        if list_level is not None:
-            return 1 if list_level == 0 else 2
-
         normalized = self._normalized_heading_text(text)
         if any(term in normalized for term in self.MAJOR_SECTION_TERMS):
             return 1
+
+        list_level = self._get_list_level(paragraph)
+        if list_level is not None and paragraphs is not None and index is not None:
+            if self._is_contextual_list_heading(paragraph, paragraphs, index):
+                return 2
 
         if "sub heading" in normalized or "subheading" in normalized or "sub section" in normalized or "subsection" in normalized:
             return 2
@@ -314,7 +424,7 @@ class Formatter:
         for index, paragraph in enumerate(template_paragraphs[1:], start=1):
             text = paragraph.text.strip()
             is_bold, max_size = self._get_paragraph_metrics(paragraph)
-            if self._is_section_heading(paragraph, text, is_bold, max_size):
+            if self._is_section_heading(paragraph, text, is_bold, max_size, template_paragraphs, index):
                 heading_index = index
                 heading_paragraph = paragraph
                 break
@@ -335,7 +445,8 @@ class Formatter:
             if not text or self._is_non_section_heading(text):
                 continue
             is_bold, max_size = self._get_paragraph_metrics(paragraph)
-            if self._is_section_heading(paragraph, text, is_bold, max_size):
+            paragraph_index = template_paragraphs.index(paragraph)
+            if self._is_section_heading(paragraph, text, is_bold, max_size, template_paragraphs, paragraph_index):
                 continue
             body_paragraph = paragraph
             break
@@ -417,13 +528,13 @@ class Formatter:
                     first_section_heading_paragraph = paragraph
                     break
 
-        for paragraph in paragraphs:
+        for index, paragraph in enumerate(paragraphs):
             text = paragraph.text.strip()
             if not text:
                 continue
 
             is_bold, max_size = self._get_paragraph_metrics(paragraph)
-            if not self._is_section_heading(paragraph, text, is_bold, max_size):
+            if not self._is_section_heading(paragraph, text, is_bold, max_size, paragraphs, index):
                 continue
 
             normalized = self._normalized_heading_text(text)
@@ -437,7 +548,7 @@ class Formatter:
         numbering_started = not has_abstract_heading
         numbering_stopped = False
 
-        for paragraph in paragraphs:
+        for index, paragraph in enumerate(paragraphs):
             text = paragraph.text.strip()
             if not text:
                 continue
@@ -449,8 +560,8 @@ class Formatter:
             paragraph.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
 
             is_bold, max_size = self._get_paragraph_metrics(paragraph)
-            is_heading_candidate = self._is_heading_candidate(paragraph, text, is_bold, max_size)
-            is_section_heading = self._is_section_heading(paragraph, text, is_bold, max_size)
+            is_heading_candidate = self._is_heading_candidate(paragraph, text, is_bold, max_size, paragraphs, index)
+            is_section_heading = self._is_section_heading(paragraph, text, is_bold, max_size, paragraphs, index)
 
             if paragraph is title_paragraph:
                 self._apply_text_profile(
@@ -473,36 +584,35 @@ class Formatter:
                 )
                 continue
 
-            if is_heading_candidate and len(text.split()) < 20:
+            if is_section_heading and len(text.split()) < 20:
                 seen_first_section_heading = True
-                if is_section_heading:
-                    normalized = self._normalized_heading_text(text)
-                    level = self._get_heading_level(paragraph, text)
-                    explicit_numbering = self._extract_numbering(text).strip()
-                    has_list_numbering = self._has_list_numbering(paragraph)
+                normalized = self._normalized_heading_text(text)
+                level = self._get_heading_level(paragraph, text, paragraphs, index)
+                explicit_numbering = self._extract_numbering(text).strip()
+                has_list_numbering = self._has_list_numbering(paragraph)
 
-                    if normalized == "abstract":
-                        numbering_started = True
-                    elif "conclusion" in normalized or "references" in normalized:
-                        numbering_stopped = True
+                if normalized == "abstract":
+                    numbering_started = True
+                elif "conclusion" in normalized or "references" in normalized:
+                    numbering_stopped = True
 
-                    if explicit_numbering:
-                        h1_num, h2_num = self._sync_numbering_counters(explicit_numbering, level, h1_num, h2_num)
-                    elif numbering_started and not numbering_stopped and normalized != "abstract":
-                        if level == 1:
-                            h1_num += 1
-                            h2_num = 0
-                            if has_list_numbering or not preserve_uploaded_numbering:
-                                self._replace_paragraph_text(paragraph, f"{h1_num}. {self._strip_numbering(text)}")
-                        else:
-                            if h1_num == 0:
-                                h1_num = 1
-                            h2_num += 1
-                            if has_list_numbering or not preserve_uploaded_numbering:
-                                self._replace_paragraph_text(paragraph, f"{h1_num}.{h2_num}. {self._strip_numbering(text)}")
+                if explicit_numbering:
+                    h1_num, h2_num = self._sync_numbering_counters(explicit_numbering, level, h1_num, h2_num)
+                elif numbering_started and not numbering_stopped and normalized != "abstract":
+                    if level == 1:
+                        h1_num += 1
+                        h2_num = 0
+                        if has_list_numbering or not preserve_uploaded_numbering:
+                            self._replace_paragraph_text(paragraph, f"{h1_num}. {self._strip_numbering(text)}")
+                    else:
+                        if h1_num == 0:
+                            h1_num = 1
+                        h2_num += 1
+                        if has_list_numbering or not preserve_uploaded_numbering:
+                            self._replace_paragraph_text(paragraph, f"{h1_num}.{h2_num}. {self._strip_numbering(text)}")
 
-                    if has_list_numbering:
-                        self._clear_list_numbering(paragraph)
+                if has_list_numbering:
+                    self._clear_list_numbering(paragraph)
 
                 self._apply_text_profile(
                     paragraph,
@@ -513,6 +623,17 @@ class Formatter:
                 )
                 paragraph.paragraph_format.left_indent = Pt(0)
                 paragraph.paragraph_format.first_line_indent = Pt(0)
+                continue
+
+            if self._has_list_numbering(paragraph):
+                self._apply_text_profile(
+                    paragraph,
+                    template_text_profile["body"],
+                    alignment=WD_ALIGN_PARAGRAPH.LEFT,
+                    force_bold=False,
+                    force_italic=False,
+                    force_color=RGBColor(0, 0, 0),
+                )
                 continue
 
             self._apply_text_profile(
